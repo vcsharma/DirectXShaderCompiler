@@ -1713,6 +1713,168 @@ void HLSignatureLower::GenerateGetMeshPayloadOperation() {
     }
   }
 }
+
+
+static void EmitInvalidTypeError(const char *sigName, Function* F, const char *supportedTys = nullptr) {
+  std::string msg(sigName);
+  msg = "invalid type used for \'" + msg + "\' semantic";
+  if (supportedTys) {
+    std::string tys(supportedTys);
+    msg += ", must be of \'" + tys + "\' type.";
+  }
+  dxilutil::EmitErrorOnFunction(F, msg);
+}
+
+// This function is adapted from ValidateSignatureElement function defined 
+// in DxilValidation.cpp. Checking here for unsupported types for semantics 
+// (esp. SV semantics) makes sense as we could bail out early instead of 
+// waiting for validator to catch it later on. This also helps prevent 
+// unexpected crashes/asserts in subsequent passes due to operating on 
+// unsupported types for semantics.
+static bool ValidateSemanticType(DxilSignatureElement& SE, Function *F) {
+  bool isValid = true;
+  DXIL::SemanticKind semanticKind = SE.GetSemantic()->GetKind();
+  CompType::Kind compKind = SE.GetCompType().GetKind();
+  unsigned compWidth = 0;
+  bool compFloat = false;
+  bool compInt = false;
+  bool compBool = false;
+
+  switch (compKind) {
+  case CompType::Kind::U64: compWidth = 64; compInt = true; break;
+  case CompType::Kind::I64: compWidth = 64; compInt = true; break;
+    // These should be translated for signatures:
+    //case CompType::Kind::PackedS8x32:
+    //case CompType::Kind::PackedU8x32:
+  case CompType::Kind::U32: compWidth = 32; compInt = true; break;
+  case CompType::Kind::I32: compWidth = 32; compInt = true; break;
+  case CompType::Kind::U16: compWidth = 16; compInt = true; break;
+  case CompType::Kind::I16: compWidth = 16; compInt = true; break;
+  case CompType::Kind::I1: compWidth = 1; compBool = true; break;
+  case CompType::Kind::F64: compWidth = 64; compFloat = true; break;
+  case CompType::Kind::F32: compWidth = 32; compFloat = true; break;
+  case CompType::Kind::F16: compWidth = 16; compFloat = true; break;
+  case CompType::Kind::SNormF64: compWidth = 64; compFloat = true; break;
+  case CompType::Kind::SNormF32: compWidth = 32; compFloat = true; break;
+  case CompType::Kind::SNormF16: compWidth = 16; compFloat = true; break;
+  case CompType::Kind::UNormF64: compWidth = 64; compFloat = true; break;
+  case CompType::Kind::UNormF32: compWidth = 32; compFloat = true; break;
+  case CompType::Kind::UNormF16: compWidth = 16; compFloat = true; break;
+  case CompType::Kind::Invalid:
+  default:
+    isValid = false;
+    EmitInvalidTypeError(SE.GetName(), F);
+    break;
+  }
+
+  bool bIsClipCull = false;
+  bool bIsTessfactor = false;
+  bool bIsBarycentric = false;
+
+  switch (semanticKind) {
+  case DXIL::SemanticKind::Depth:
+  case DXIL::SemanticKind::DepthGreaterEqual:
+  case DXIL::SemanticKind::DepthLessEqual:
+    if (!compFloat || compWidth > 32 || SE.GetCols() != 1) {
+      isValid = false;
+      EmitInvalidTypeError(SE.GetSemantic()->GetName(), F, "float");
+    }
+    break;
+  case DXIL::SemanticKind::Coverage:
+    __fallthrough;
+  case DXIL::SemanticKind::InnerCoverage:
+  case DXIL::SemanticKind::OutputControlPointID:
+    if (compKind != CompType::Kind::U32 || SE.GetCols() != 1) {
+      isValid = false;
+      EmitInvalidTypeError(SE.GetSemantic()->GetName(), F, "uint");
+    }
+    break;
+  case DXIL::SemanticKind::Position:
+    if (!compFloat || compWidth > 32 || SE.GetCols() != 4) {
+      isValid = false;
+      EmitInvalidTypeError(SE.GetSemantic()->GetName(), F, "float4");
+    }
+    break;
+  case DXIL::SemanticKind::Target:
+    if (compWidth > 32) {
+      isValid = false;
+      EmitInvalidTypeError(SE.GetSemantic()->GetName(), F, "float/int/uint");
+    }
+    break;
+  case DXIL::SemanticKind::ClipDistance:
+  case DXIL::SemanticKind::CullDistance:
+    bIsClipCull = true;
+    if (!compFloat || compWidth > 32) {
+      isValid = false;
+      EmitInvalidTypeError(SE.GetSemantic()->GetName(), F, "float");
+    }
+    break;
+  case DXIL::SemanticKind::IsFrontFace: {
+    // Type of IsFrontface may get patched to int later on in patchIsFrontfaceTy,
+    // but here allow both bool and int.
+    if (!((compInt && compWidth == 32) || compBool) || SE.GetCols() != 1) {
+      isValid = false;
+      EmitInvalidTypeError(SE.GetSemantic()->GetName(), F, "bool/uint");
+    }
+  } break;
+  case DXIL::SemanticKind::RenderTargetArrayIndex:
+  case DXIL::SemanticKind::ViewPortArrayIndex:
+  case DXIL::SemanticKind::VertexID:
+  case DXIL::SemanticKind::PrimitiveID:
+  case DXIL::SemanticKind::InstanceID:
+  case DXIL::SemanticKind::GSInstanceID:
+  case DXIL::SemanticKind::SampleIndex:
+  case DXIL::SemanticKind::StencilRef:
+  case DXIL::SemanticKind::ShadingRate:
+    if ((compKind != CompType::Kind::U32 && compKind != CompType::Kind::U16) || SE.GetCols() != 1) {
+      isValid = false;
+      EmitInvalidTypeError(SE.GetSemantic()->GetName(), F, "uint");
+    }
+    break;
+  case DXIL::SemanticKind::CullPrimitive: {
+    if (!(compBool && compWidth == 1) || SE.GetCols() != 1) {
+      isValid = false;
+      EmitInvalidTypeError(SE.GetSemantic()->GetName(), F, "bool");
+    }
+  } break;
+  case DXIL::SemanticKind::TessFactor:
+  case DXIL::SemanticKind::InsideTessFactor:
+    bIsTessfactor = true;
+    if (!compFloat || compWidth > 32) {
+      isValid = false;
+      EmitInvalidTypeError(SE.GetSemantic()->GetName(), F, "float");
+    }
+    break;
+  case DXIL::SemanticKind::Arbitrary:
+    break;
+  case DXIL::SemanticKind::DomainLocation:
+  case DXIL::SemanticKind::Invalid:
+    break;
+  case DXIL::SemanticKind::Barycentrics:
+    bIsBarycentric = true;
+    if (!compFloat || compWidth > 32) {
+      isValid = false;
+      EmitInvalidTypeError(SE.GetSemantic()->GetName(), F, "float");
+    }
+    break;
+  default:
+    break;
+  }
+
+  return isValid;
+}
+
+bool HLSignatureLower::ValidateSemanticsType() {
+  bool isValid = true;
+  for (const auto &kv : m_sigValueMap) {
+    isValid &= ValidateSemanticType(*(kv.first), Entry);
+  }
+  for (const auto& kv : m_patchConstantInputsSigMap) {
+    isValid &= ValidateSemanticType(*(kv.second), Entry);
+  }
+  return isValid;
+}
+
 // Lower signatures.
 void HLSignatureLower::Run() {
   DxilFunctionProps &props = HLM.GetDxilFunctionProps(Entry);
@@ -1725,6 +1887,10 @@ void HLSignatureLower::Run() {
 
     // Allocate input output.
     AllocateDxilInputOutputs();
+
+    // If validation fails for semantic type, bail out early!
+    if (!ValidateSemanticsType())
+      return;
 
     GenerateDxilInputs();
     GenerateDxilOutputs();

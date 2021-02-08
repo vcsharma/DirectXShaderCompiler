@@ -45,6 +45,7 @@ private:
                        const ShaderModel *pSM, bool isPatchConstantFunction,
                        bool forceOut, bool &hasClipPlane);
   void CreateDxilSignatures();
+  bool ValidateSemanticsType();
   // Allocate DXIL input/output.
   void AllocateDxilInputOutputs();
   // Generate DXIL input load, output store
